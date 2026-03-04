@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Streamlit web app for SIP analysis and model fitting."""
+"""Streamlit web app for SIP plotting, comparison, and model fitting."""
 
 from __future__ import annotations
 
@@ -28,6 +28,26 @@ MODEL_OPTIONS = [
 ]
 
 UNCERTAINTY_OPTIONS = ["None", "Bootstrap CI", "MCMC (experimental)"]
+
+COLORBLIND_COLORS = [
+    "#0072B2",  # blue
+    "#E69F00",  # orange
+    "#009E73",  # green
+    "#D55E00",  # vermillion
+    "#CC79A7",  # reddish purple
+    "#56B4E9",  # sky blue
+    "#F0E442",  # yellow
+    "#000000",  # black
+]
+
+MARKERS = ["o", "s", "^", "D", "v", "P", "X", "<", ">", "*"]
+
+
+def _style_for_name(name: str) -> tuple[str, str]:
+    idx = sum(ord(c) for c in name)
+    color = COLORBLIND_COLORS[idx % len(COLORBLIND_COLORS)]
+    marker = MARKERS[(idx // len(COLORBLIND_COLORS)) % len(MARKERS)]
+    return color, marker
 
 
 def _extract_param_columns(best_params: np.ndarray | None, n_terms: int, beta_free: bool) -> dict[str, float | None]:
@@ -58,6 +78,264 @@ def _extract_param_columns(best_params: np.ndarray | None, n_terms: int, beta_fr
         out[f"p_c{term}"] = c_or_a
         out[f"p_beta{term}"] = beta
     return out
+
+
+def _normalize_cond_df(df: pd.DataFrame, file_name: str) -> pd.DataFrame:
+    out = df.copy()
+    if "file" not in out.columns:
+        out["file"] = file_name
+
+    required = {"frequency_hz", "sigma_in_phase_uS_cm", "sigma_quadrature_uS_cm"}
+    if not required.issubset(out.columns):
+        raise ValueError("Missing required conductivity columns.")
+
+    if "minus_phase_mrad" not in out.columns:
+        sigma_in = out["sigma_in_phase_uS_cm"].to_numpy(dtype=float)
+        sigma_q = out["sigma_quadrature_uS_cm"].to_numpy(dtype=float)
+        out["minus_phase_mrad"] = -1000.0 * np.arctan2(sigma_q, np.maximum(np.abs(sigma_in), 1e-12))
+
+    return out[["file", "frequency_hz", "sigma_in_phase_uS_cm", "sigma_quadrature_uS_cm", "minus_phase_mrad"]].copy()
+
+
+def _load_uploaded_plot_df(uploaded_file, gf: float) -> pd.DataFrame:
+    name = uploaded_file.name
+    raw_bytes = uploaded_file.getvalue()
+
+    try:
+        parsed_csv = pd.read_csv(BytesIO(raw_bytes))
+    except Exception:
+        parsed_csv = pd.DataFrame()
+
+    mean_cols = {"frequency_hz", "sigma_in_phase_mean_uS_cm", "sigma_quadrature_mean_uS_cm"}
+    cond_cols = {"frequency_hz", "sigma_in_phase_uS_cm", "sigma_quadrature_uS_cm"}
+
+    if mean_cols.issubset(parsed_csv.columns):
+        work = parsed_csv.copy()
+        work["sigma_in_phase_uS_cm"] = work["sigma_in_phase_mean_uS_cm"]
+        work["sigma_quadrature_uS_cm"] = work["sigma_quadrature_mean_uS_cm"]
+        if "minus_phase_mean_mrad" in work.columns:
+            work["minus_phase_mrad"] = work["minus_phase_mean_mrad"]
+        return _normalize_cond_df(work, name)
+
+    if cond_cols.issubset(parsed_csv.columns):
+        return _normalize_cond_df(parsed_csv, name)
+
+    with NamedTemporaryFile(suffix=".csv") as tmp:
+        tmp.write(raw_bytes)
+        tmp.flush()
+        parsed = analysis_io.parse_sip_csv(tmp.name)
+
+    parsed = analysis_transform.add_conductivity_columns(parsed, gf)
+    return _normalize_cond_df(parsed, name)
+
+
+def _combine_plot_uploads(uploaded_files, gf: float, fmin: float | None, fmax: float | None):
+    frames: list[pd.DataFrame] = []
+    skipped: list[str] = []
+
+    for uploaded_file in uploaded_files:
+        try:
+            df = _load_uploaded_plot_df(uploaded_file, gf)
+            mask = (
+                np.isfinite(df["frequency_hz"])
+                & np.isfinite(df["sigma_in_phase_uS_cm"])
+                & np.isfinite(df["sigma_quadrature_uS_cm"])
+                & np.isfinite(df["minus_phase_mrad"])
+                & (df["frequency_hz"] > 0)
+            )
+            if fmin is not None:
+                mask &= df["frequency_hz"] >= fmin
+            if fmax is not None:
+                mask &= df["frequency_hz"] <= fmax
+            df = df.loc[mask].copy()
+            if df.empty:
+                raise ValueError("No valid rows remain after filtering.")
+            frames.append(df)
+        except Exception as exc:
+            skipped.append(f"{uploaded_file.name}: {exc}")
+
+    if not frames:
+        return pd.DataFrame(), skipped
+
+    out = pd.concat(frames, ignore_index=True)
+    out = out.sort_values(["file", "frequency_hz"]).reset_index(drop=True)
+    return out, skipped
+
+
+def _build_plot_only_figure(df: pd.DataFrame, mean_only: bool):
+    fig, axs = analysis_plotting.init_2x2_layout("SIP Results")
+    handles = []
+    labels = []
+    peak_rows: list[dict[str, float | str]] = []
+
+    mean_std_df = pd.DataFrame()
+    if mean_only:
+        mean_std_df = analysis_stats.compute_mean_std(df)
+        x = mean_std_df["frequency_hz"].to_numpy(dtype=float)
+
+        line = None
+        for ax, mean_col, std_col in [
+            (axs[0, 0], "sigma_in_phase_mean_uS_cm", "sigma_in_phase_std_uS_cm"),
+            (axs[0, 1], "sigma_quadrature_mean_uS_cm", "sigma_quadrature_std_uS_cm"),
+            (axs[1, 0], "minus_phase_mean_mrad", "minus_phase_std_mrad"),
+        ]:
+            y = mean_std_df[mean_col].to_numpy(dtype=float)
+            s = mean_std_df[std_col].to_numpy(dtype=float)
+            ax.fill_between(x, y - s, y + s, color="black", alpha=0.15, linewidth=0)
+            line = ax.plot(x, y, linestyle="-", linewidth=1.8, color="black")[0]
+
+        if line is not None:
+            handles.append(line)
+            labels.append("Mean ± STD")
+    else:
+        for file_name, group in df.groupby("file", sort=True):
+            agg = (
+                group.groupby("frequency_hz", as_index=False)[
+                    ["sigma_in_phase_uS_cm", "sigma_quadrature_uS_cm", "minus_phase_mrad"]
+                ]
+                .mean()
+                .sort_values("frequency_hz")
+            )
+            color, marker = _style_for_name(str(file_name))
+            x_raw = agg["frequency_hz"].to_numpy(dtype=float)
+            y_in_raw = agg["sigma_in_phase_uS_cm"].to_numpy(dtype=float)
+            y_q_raw = agg["sigma_quadrature_uS_cm"].to_numpy(dtype=float)
+            y_p_raw = agg["minus_phase_mrad"].to_numpy(dtype=float)
+
+            x_i, y_in_i = analysis_stats.interpolate_log_curve(x_raw, y_in_raw)
+            _, y_q_i = analysis_stats.interpolate_log_curve(x_raw, y_q_raw)
+            _, y_p_i = analysis_stats.interpolate_log_curve(x_raw, y_p_raw)
+
+            axs[0, 0].plot(x_raw, y_in_raw, linestyle="None", marker=marker, markersize=5, color=color)
+            h = axs[0, 0].plot(x_i, y_in_i, linestyle="-", linewidth=1.6, color=color, label=str(file_name))[0]
+            axs[0, 1].plot(x_raw, y_q_raw, linestyle="None", marker=marker, markersize=5, color=color)
+            axs[0, 1].plot(x_i, y_q_i, linestyle="-", linewidth=1.6, color=color)
+            axs[1, 0].plot(x_raw, y_p_raw, linestyle="None", marker=marker, markersize=5, color=color)
+            axs[1, 0].plot(x_i, y_p_i, linestyle="-", linewidth=1.6, color=color)
+
+            if len(x_i) > 0 and np.isfinite(y_q_i).any():
+                idx_peak = int(np.nanargmax(y_q_i))
+                f_peak = float(x_i[idx_peak])
+                sigma_q_peak = float(y_q_i[idx_peak])
+                tau_peak = 1.0 / (2.0 * np.pi * f_peak)
+                axs[0, 1].axvline(f_peak, color=color, linestyle="--", alpha=0.35, linewidth=1.0)
+                peak_rows.append(
+                    {
+                        "File": str(file_name),
+                        "f_peak (Hz)": f_peak,
+                        "sigma''_peak (uS/cm)": sigma_q_peak,
+                        "tau_peak (s)": tau_peak,
+                    }
+                )
+
+            handles.append(h)
+            labels.append(str(file_name))
+
+    if handles:
+        axs[1, 1].legend(handles, labels, loc="center", frameon=False)
+
+    fig.tight_layout()
+    return fig, mean_std_df, pd.DataFrame(peak_rows)
+
+
+def _load_uploaded_mean_df(uploaded_file) -> pd.DataFrame:
+    df = pd.read_csv(BytesIO(uploaded_file.getvalue()))
+    required = {
+        "frequency_hz",
+        "sigma_in_phase_mean_uS_cm",
+        "sigma_quadrature_mean_uS_cm",
+        "minus_phase_mean_mrad",
+    }
+    if not required.issubset(df.columns):
+        raise ValueError("Missing required mean columns.")
+    return df.sort_values("frequency_hz")
+
+
+def _build_mean_comparison_plot(uploaded_files):
+    fig, axs = analysis_plotting.init_2x2_layout("Saved Mean ± Std DF Plot")
+    handles = []
+    labels = []
+    skipped: list[str] = []
+
+    for uploaded_file in uploaded_files:
+        name = uploaded_file.name
+        try:
+            df = _load_uploaded_mean_df(uploaded_file)
+        except Exception as exc:
+            skipped.append(f"{name}: {exc}")
+            continue
+
+        color, marker = _style_for_name(name)
+        h = axs[0, 0].plot(
+            df["frequency_hz"],
+            df["sigma_in_phase_mean_uS_cm"],
+            linestyle="None",
+            marker=marker,
+            markersize=6,
+            color=color,
+            label=name,
+        )[0]
+        axs[0, 1].plot(
+            df["frequency_hz"],
+            df["sigma_quadrature_mean_uS_cm"],
+            linestyle="None",
+            marker=marker,
+            markersize=6,
+            color=color,
+        )
+        axs[1, 0].plot(
+            df["frequency_hz"],
+            df["minus_phase_mean_mrad"],
+            linestyle="None",
+            marker=marker,
+            markersize=6,
+            color=color,
+        )
+
+        if "sigma_in_phase_std_uS_cm" in df.columns:
+            axs[0, 0].errorbar(
+                df["frequency_hz"],
+                df["sigma_in_phase_mean_uS_cm"],
+                yerr=df["sigma_in_phase_std_uS_cm"],
+                linestyle="None",
+                marker="None",
+                ecolor=color,
+                alpha=0.7,
+                capsize=2,
+            )
+        if "sigma_quadrature_std_uS_cm" in df.columns:
+            axs[0, 1].errorbar(
+                df["frequency_hz"],
+                df["sigma_quadrature_mean_uS_cm"],
+                yerr=df["sigma_quadrature_std_uS_cm"],
+                linestyle="None",
+                marker="None",
+                ecolor=color,
+                alpha=0.7,
+                capsize=2,
+            )
+        if "minus_phase_std_mrad" in df.columns:
+            axs[1, 0].errorbar(
+                df["frequency_hz"],
+                df["minus_phase_mean_mrad"],
+                yerr=df["minus_phase_std_mrad"],
+                linestyle="None",
+                marker="None",
+                ecolor=color,
+                alpha=0.7,
+                capsize=2,
+            )
+
+        handles.append(h)
+        labels.append(name)
+
+    if not handles:
+        plt.close(fig)
+        raise ValueError("No valid mean DF files to plot.")
+
+    axs[1, 1].legend(handles, labels, loc="center", frameon=False)
+    fig.tight_layout()
+    return fig, skipped
 
 
 def _load_uploaded_dataset(uploaded_file, gf: float) -> tuple[str, np.ndarray, np.ndarray, np.ndarray]:
@@ -309,38 +587,174 @@ def _build_fit_plot(model_name: str, plot_rows: list[dict[str, object]]):
     return fig
 
 
-def main() -> None:
-    st.set_page_config(layout="wide", page_title="SIP Analysis Web App")
-    st.title("SIP Analysis Web App")
+def _render_plot_compare_tab() -> None:
+    st.subheader("Plot and Compare")
+    st.caption("Plot raw/processed SIP files, compute Mean ± STD across files, and compare saved mean-DF CSVs.")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        gf = st.number_input("Geometric factor (1/cm)", min_value=1e-12, value=1.0, format="%.6g", key="plot_gf")
+    with c2:
+        fmin = st.number_input("Min freq (Hz)", min_value=0.0, value=0.0, format="%.6g", key="plot_fmin")
+    with c3:
+        fmax = st.number_input("Max freq (Hz)", min_value=0.0, value=0.0, format="%.6g", key="plot_fmax")
+
+    mean_only = st.checkbox("Mean ± STD only", value=False, key="plot_mean_only")
+    uploaded_plot_files = st.file_uploader(
+        "Upload SIP CSV(s) for plotting",
+        type=["csv", "txt"],
+        accept_multiple_files=True,
+        key="plot_uploader",
+    )
+
+    if uploaded_plot_files:
+        st.write(f"Loaded files: {len(uploaded_plot_files)}")
+        st.dataframe(
+            pd.DataFrame({"filename": [f.name for f in uploaded_plot_files]}),
+            use_container_width=True,
+            height=180,
+        )
+
+    if st.button("Plot Uploaded Files", type="primary", key="plot_button"):
+        fmin_val = fmin if fmin > 0 else None
+        fmax_val = fmax if fmax > 0 else None
+        if fmin_val is not None and fmax_val is not None and fmin_val > fmax_val:
+            st.error("Min frequency must be <= max frequency.")
+            return
+
+        if not uploaded_plot_files:
+            st.error("Upload at least one file for plotting.")
+            return
+
+        combined_df, skipped = _combine_plot_uploads(uploaded_plot_files, gf=float(gf), fmin=fmin_val, fmax=fmax_val)
+        if skipped:
+            st.warning("Some files failed:\n\n" + "\n".join(skipped))
+        if combined_df.empty:
+            st.error("No valid rows available for plotting.")
+            return
+
+        try:
+            fig, mean_std_df, peak_df = _build_plot_only_figure(combined_df, mean_only=mean_only)
+        except Exception as exc:
+            st.error(f"Plot failed: {exc}")
+            return
+
+        st.pyplot(fig, use_container_width=True)
+
+        combined_csv = combined_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download combined dataframe CSV",
+            data=combined_csv,
+            file_name="sip_combined_dataframe.csv",
+            mime="text/csv",
+            key="dl_combined_csv",
+        )
+
+        if not peak_df.empty:
+            st.subheader("Peak Summary")
+            st.dataframe(peak_df, use_container_width=True)
+
+        if not mean_std_df.empty:
+            st.subheader("Mean ± STD")
+            st.dataframe(mean_std_df, use_container_width=True)
+            mean_csv = mean_std_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download mean±std CSV",
+                data=mean_csv,
+                file_name="sip_mean_std.csv",
+                mime="text/csv",
+                key="dl_mean_std_csv",
+            )
+
+        plot_png = BytesIO()
+        fig.savefig(plot_png, format="png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        st.download_button(
+            "Download plot PNG",
+            data=plot_png.getvalue(),
+            file_name="sip_plot.png",
+            mime="image/png",
+            key="dl_plot_png",
+        )
+
+    st.divider()
+    st.subheader("Compare Saved Mean DF CSV(s)")
+    compare_files = st.file_uploader(
+        "Upload saved mean-DF CSV(s)",
+        type=["csv"],
+        accept_multiple_files=True,
+        key="compare_uploader",
+    )
+
+    if st.button("Plot Mean DF(s)", key="compare_plot_button"):
+        if not compare_files:
+            st.error("Upload at least one mean-DF CSV.")
+            return
+
+        try:
+            fig, skipped = _build_mean_comparison_plot(compare_files)
+        except Exception as exc:
+            st.error(f"Comparison plot failed: {exc}")
+            return
+
+        if skipped:
+            st.warning("Skipped files:\n\n" + "\n".join(skipped))
+
+        st.pyplot(fig, use_container_width=True)
+        comp_png = BytesIO()
+        fig.savefig(comp_png, format="png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        st.download_button(
+            "Download mean comparison PNG",
+            data=comp_png.getvalue(),
+            file_name="sip_mean_plot.png",
+            mime="image/png",
+            key="dl_mean_plot_png",
+        )
+
+
+def _render_fit_tab() -> None:
+    st.subheader("Model Fitting")
     st.caption("Upload SIP CSV files, run relaxation-model fitting, review 2x2 fit plots, and export results.")
 
-    with st.sidebar:
-        st.header("Fit Configuration")
-        gf = st.number_input("Geometric factor (1/cm)", min_value=1e-12, value=1.0, format="%.6g")
-        fmin = st.number_input("Min freq (Hz)", min_value=0.0, value=0.0, format="%.6g")
-        fmax = st.number_input("Max freq (Hz)", min_value=0.0, value=0.0, format="%.6g")
-        model_name = st.selectbox("Model", MODEL_OPTIONS, index=0)
-        unc_mode = st.selectbox("Uncertainty", UNCERTAINTY_OPTIONS, index=0)
-        unc_n = st.number_input("N samples/steps", min_value=1, value=80, step=1)
-        ci_level = st.number_input("CI (%)", min_value=50.0, max_value=99.9, value=95.0, step=0.5)
-        cvnn_ntrain = st.number_input("CVNN train N", min_value=200, value=3000, step=100)
-        cvnn_epochs = st.number_input("CVNN epochs", min_value=50, value=800, step=50)
-        run_fit = st.button("Fit Uploaded Files", type="primary")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        gf = st.number_input("Geometric factor (1/cm)", min_value=1e-12, value=1.0, format="%.6g", key="fit_gf")
+    with c2:
+        fmin = st.number_input("Min freq (Hz)", min_value=0.0, value=0.0, format="%.6g", key="fit_fmin")
+    with c3:
+        fmax = st.number_input("Max freq (Hz)", min_value=0.0, value=0.0, format="%.6g", key="fit_fmax")
+
+    model_name = st.selectbox("Model", MODEL_OPTIONS, index=0, key="fit_model")
+
+    uc1, uc2, uc3, uc4 = st.columns(4)
+    with uc1:
+        unc_mode = st.selectbox("Uncertainty", UNCERTAINTY_OPTIONS, index=0, key="fit_unc_mode")
+    with uc2:
+        unc_n = st.number_input("N samples/steps", min_value=1, value=80, step=1, key="fit_unc_n")
+    with uc3:
+        ci_level = st.number_input("CI (%)", min_value=50.0, max_value=99.9, value=95.0, step=0.5, key="fit_ci")
+    with uc4:
+        cvnn_ntrain = st.number_input("CVNN train N", min_value=200, value=3000, step=100, key="fit_cvnn_train")
+
+    cvnn_epochs = st.number_input("CVNN epochs", min_value=50, value=800, step=50, key="fit_cvnn_epochs")
 
     uploaded_files = st.file_uploader(
         "Upload raw SIP CSV(s) or mean-DF CSV(s)",
         type=["csv", "txt"],
         accept_multiple_files=True,
+        key="fit_uploader",
     )
 
-    if not uploaded_files:
-        st.info("Upload at least one file to begin.")
+    if uploaded_files:
+        st.write(f"Loaded files: {len(uploaded_files)}")
+        st.dataframe(pd.DataFrame({"filename": [f.name for f in uploaded_files]}), use_container_width=True, height=180)
+
+    if not st.button("Fit Uploaded Files", type="primary", key="fit_button"):
         return
 
-    st.write(f"Loaded files: {len(uploaded_files)}")
-    st.dataframe(pd.DataFrame({"filename": [f.name for f in uploaded_files]}), use_container_width=True, height=180)
-
-    if not run_fit:
+    if not uploaded_files:
+        st.error("Upload at least one file to fit.")
         return
 
     fmin_val = fmin if fmin > 0 else None
@@ -377,12 +791,31 @@ def main() -> None:
     st.dataframe(df, use_container_width=True)
 
     csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download fit results CSV", data=csv_bytes, file_name="sip_fit_results.csv", mime="text/csv")
+    st.download_button(
+        "Download fit results CSV", data=csv_bytes, file_name="sip_fit_results.csv", mime="text/csv", key="dl_fit_csv"
+    )
 
     png_buffer = BytesIO()
     fig.savefig(png_buffer, format="png", dpi=200, bbox_inches="tight")
     plt.close(fig)
-    st.download_button("Download fit plot PNG", data=png_buffer.getvalue(), file_name="sip_fit_plot.png", mime="image/png")
+    st.download_button(
+        "Download fit plot PNG",
+        data=png_buffer.getvalue(),
+        file_name="sip_fit_plot.png",
+        mime="image/png",
+        key="dl_fit_png",
+    )
+
+
+def main() -> None:
+    st.set_page_config(layout="wide", page_title="SIP Analysis Web App")
+    st.title("SIP Analysis Web App")
+
+    tab_plot, tab_fit = st.tabs(["Plot and Compare", "Model Fitting"])
+    with tab_plot:
+        _render_plot_compare_tab()
+    with tab_fit:
+        _render_fit_tab()
 
 
 if __name__ == "__main__":
