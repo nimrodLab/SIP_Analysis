@@ -26,3 +26,17 @@ Use `Help -> Export Debug Bundle` in the app to export:
 - dataset and fit counts
 
 Share this bundle when reporting issues.
+
+## Streamlit Web App (Branch: `webapp-streamlit`)
+
+Run:
+
+```bash
+pip install streamlit numpy pandas matplotlib scipy scikit-learn emcee torch
+streamlit run streamlit_app.py
+```
+
+Notes:
+
+- This is a web UI for the existing SIP model-fitting pipeline.
+- CVNN mode requires PyTorch and the bundled paper repo folder.
