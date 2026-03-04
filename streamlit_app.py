@@ -452,8 +452,10 @@ def _fit_uploaded_files(
                     best_params, n_terms, beta_free
                 )
 
-            pred_phase = -1000.0 * np.arctan2(pred_q, np.maximum(np.abs(pred_in), 1e-12))
-            raw_phase = -1000.0 * np.arctan2(sigma_q, np.maximum(np.abs(sigma_in), 1e-12))
+            # Plot convention is -phase (mrad): negative phase should appear positive.
+            # Use signed in-phase conductivity in atan2 for correct quadrant/sign handling.
+            pred_phase = -1000.0 * np.arctan2(pred_q, pred_in)
+            raw_phase = -1000.0 * np.arctan2(sigma_q, sigma_in)
             x_dense, pred_q_dense = analysis_stats.interpolate_log_curve(freq, pred_q, points=600)
             peak_idx = int(np.nanargmax(pred_q_dense))
             f_peak = float(x_dense[peak_idx])
