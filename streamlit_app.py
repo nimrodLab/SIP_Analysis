@@ -50,6 +50,70 @@ def _style_for_name(name: str) -> tuple[str, str]:
     return color, marker
 
 
+def _legend_name(raw_name: str, legend_map: dict[str, str] | None) -> str:
+    if not legend_map:
+        return raw_name
+    custom = legend_map.get(raw_name, "").strip()
+    return custom or raw_name
+
+
+def _render_loaded_files_legend_table(uploaded_files, key_prefix: str) -> dict[str, str]:
+    legend_map: dict[str, str] = {}
+    if not uploaded_files:
+        return legend_map
+
+    st.markdown("**File legend table**")
+    h1, h2 = st.columns([0.6, 0.4])
+    h1.markdown("**File name**")
+    h2.markdown("**Legend text**")
+
+    for idx, uploaded_file in enumerate(uploaded_files):
+        file_name = uploaded_file.name
+        key = f"{key_prefix}_legend_{idx}_{file_name}"
+        if key not in st.session_state:
+            st.session_state[key] = file_name
+
+        c1, c2 = st.columns([0.6, 0.4])
+        c1.write(file_name)
+        legend_map[file_name] = (
+            c2.text_input(
+                f"Legend for {file_name}",
+                key=key,
+                label_visibility="collapsed",
+            ).strip()
+            or file_name
+        )
+    return legend_map
+
+
+def _show_dataframe(df: pd.DataFrame, *, use_container_width: bool = True, height: int | None = None) -> None:
+    kwargs: dict[str, object] = {"use_container_width": use_container_width}
+    if height is not None:
+        kwargs["height"] = height
+
+    try:
+        st.dataframe(df, **kwargs)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if not any(token in msg for token in ("pyarrow", "brotli", "arrow")):
+            raise
+        if not st.session_state.get("_arrow_fallback_notice_shown", False):
+            st.warning(
+                "Interactive table view is unavailable due to a PyArrow/Brotli environment conflict. "
+                "Showing plain text tables instead."
+            )
+            st.session_state["_arrow_fallback_notice_shown"] = True
+        st.code(df.to_string(index=False), language="text")
+
+
+def _apply_legend_map_to_file_col(df: pd.DataFrame, legend_map: dict[str, str] | None) -> pd.DataFrame:
+    if not legend_map or "file" not in df.columns:
+        return df
+    out = df.copy()
+    out["file"] = out["file"].astype(str).map(lambda x: _legend_name(x, legend_map))
+    return out
+
+
 def _extract_param_columns(best_params: np.ndarray | None, n_terms: int, beta_free: bool) -> dict[str, float | None]:
     out: dict[str, float | None] = {
         "p_m1": None,
@@ -82,8 +146,8 @@ def _extract_param_columns(best_params: np.ndarray | None, n_terms: int, beta_fr
 
 def _normalize_cond_df(df: pd.DataFrame, file_name: str) -> pd.DataFrame:
     out = df.copy()
-    if "file" not in out.columns:
-        out["file"] = file_name
+    # Always keep the user-uploaded filename so legend mapping is stable.
+    out["file"] = file_name
 
     required = {"frequency_hz", "sigma_in_phase_uS_cm", "sigma_quadrature_uS_cm"}
     if not required.issubset(out.columns):
@@ -162,7 +226,7 @@ def _combine_plot_uploads(uploaded_files, gf: float, fmin: float | None, fmax: f
     return out, skipped
 
 
-def _build_plot_only_figure(df: pd.DataFrame, mean_only: bool):
+def _build_plot_only_figure(df: pd.DataFrame, mean_only: bool, legend_map: dict[str, str] | None = None):
     fig, axs = analysis_plotting.init_2x2_layout("SIP Results")
     handles = []
     labels = []
@@ -186,9 +250,14 @@ def _build_plot_only_figure(df: pd.DataFrame, mean_only: bool):
 
         if line is not None:
             handles.append(line)
-            labels.append("Mean ± STD")
+            if legend_map:
+                file_labels = sorted({_legend_name(str(f), legend_map) for f in df["file"].astype(str).unique()})
+                labels.append("Mean ± STD: " + ", ".join(file_labels))
+            else:
+                labels.append("Mean ± STD")
     else:
         for file_name, group in df.groupby("file", sort=True):
+            display_name = _legend_name(str(file_name), legend_map)
             agg = (
                 group.groupby("frequency_hz", as_index=False)[
                     ["sigma_in_phase_uS_cm", "sigma_quadrature_uS_cm", "minus_phase_mrad"]
@@ -207,7 +276,7 @@ def _build_plot_only_figure(df: pd.DataFrame, mean_only: bool):
             _, y_p_i = analysis_stats.interpolate_log_curve(x_raw, y_p_raw)
 
             axs[0, 0].plot(x_raw, y_in_raw, linestyle="None", marker=marker, markersize=5, color=color)
-            h = axs[0, 0].plot(x_i, y_in_i, linestyle="-", linewidth=1.6, color=color, label=str(file_name))[0]
+            h = axs[0, 0].plot(x_i, y_in_i, linestyle="-", linewidth=1.6, color=color, label=display_name)[0]
             axs[0, 1].plot(x_raw, y_q_raw, linestyle="None", marker=marker, markersize=5, color=color)
             axs[0, 1].plot(x_i, y_q_i, linestyle="-", linewidth=1.6, color=color)
             axs[1, 0].plot(x_raw, y_p_raw, linestyle="None", marker=marker, markersize=5, color=color)
@@ -221,7 +290,7 @@ def _build_plot_only_figure(df: pd.DataFrame, mean_only: bool):
                 axs[0, 1].axvline(f_peak, color=color, linestyle="--", alpha=0.35, linewidth=1.0)
                 peak_rows.append(
                     {
-                        "File": str(file_name),
+                        "File": display_name,
                         "f_peak (Hz)": f_peak,
                         "sigma''_peak (uS/cm)": sigma_q_peak,
                         "tau_peak (s)": tau_peak,
@@ -229,7 +298,7 @@ def _build_plot_only_figure(df: pd.DataFrame, mean_only: bool):
                 )
 
             handles.append(h)
-            labels.append(str(file_name))
+            labels.append(display_name)
 
     if handles:
         axs[1, 1].legend(handles, labels, loc="center", frameon=False)
@@ -251,7 +320,7 @@ def _load_uploaded_mean_df(uploaded_file) -> pd.DataFrame:
     return df.sort_values("frequency_hz")
 
 
-def _build_mean_comparison_plot(uploaded_files):
+def _build_mean_comparison_plot(uploaded_files, legend_map: dict[str, str] | None = None):
     fig, axs = analysis_plotting.init_2x2_layout("Saved Mean ± Std DF Plot")
     handles = []
     labels = []
@@ -259,6 +328,7 @@ def _build_mean_comparison_plot(uploaded_files):
 
     for uploaded_file in uploaded_files:
         name = uploaded_file.name
+        display_name = _legend_name(name, legend_map)
         try:
             df = _load_uploaded_mean_df(uploaded_file)
         except Exception as exc:
@@ -273,7 +343,7 @@ def _build_mean_comparison_plot(uploaded_files):
             marker=marker,
             markersize=6,
             color=color,
-            label=name,
+            label=display_name,
         )[0]
         axs[0, 1].plot(
             df["frequency_hz"],
@@ -327,7 +397,7 @@ def _build_mean_comparison_plot(uploaded_files):
             )
 
         handles.append(h)
-        labels.append(name)
+        labels.append(display_name)
 
     if not handles:
         plt.close(fig)
@@ -390,6 +460,7 @@ def _fmt_ci(value: object) -> str:
 
 def _fit_uploaded_files(
     uploaded_files,
+    legend_map: dict[str, str] | None,
     model_name: str,
     gf: float,
     fmin: float | None,
@@ -407,6 +478,7 @@ def _fit_uploaded_files(
     for uploaded_file in uploaded_files:
         try:
             name, freq, sigma_in, sigma_q = _load_uploaded_dataset(uploaded_file, gf)
+            display_name = _legend_name(name, legend_map)
             mask = np.isfinite(freq) & np.isfinite(sigma_in) & np.isfinite(sigma_q) & (freq > 0)
             if fmin is not None:
                 mask &= freq >= fmin
@@ -493,7 +565,7 @@ def _fit_uploaded_files(
             resid = np.sqrt((pred_in - sigma_in) ** 2 + (pred_q - sigma_q) ** 2)
             plot_rows.append(
                 {
-                    "name": name,
+                    "name": display_name,
                     "freq": freq,
                     "sigma_in": sigma_in,
                     "sigma_q": sigma_q,
@@ -507,7 +579,7 @@ def _fit_uploaded_files(
             )
             fit_results.append(
                 {
-                    "name": name,
+                    "name": display_name,
                     "model": model_name,
                     "sigma_dc_uS_cm": sigma_dc_uS_cm,
                     "sigma_inf_uS_cm": sigma_inf_uS_cm,
@@ -611,11 +683,7 @@ def _render_plot_compare_tab() -> None:
 
     if uploaded_plot_files:
         st.write(f"Loaded files: {len(uploaded_plot_files)}")
-        st.dataframe(
-            pd.DataFrame({"filename": [f.name for f in uploaded_plot_files]}),
-            use_container_width=True,
-            height=180,
-        )
+    plot_legend_map = _render_loaded_files_legend_table(uploaded_plot_files, "plot")
 
     if st.button("Plot Uploaded Files", type="primary", key="plot_button"):
         fmin_val = fmin if fmin > 0 else None
@@ -636,7 +704,12 @@ def _render_plot_compare_tab() -> None:
             return
 
         try:
-            fig, mean_std_df, peak_df = _build_plot_only_figure(combined_df, mean_only=mean_only)
+            combined_df = _apply_legend_map_to_file_col(combined_df, plot_legend_map)
+            fig, mean_std_df, peak_df = _build_plot_only_figure(
+                combined_df,
+                mean_only=mean_only,
+                legend_map=plot_legend_map,
+            )
         except Exception as exc:
             st.error(f"Plot failed: {exc}")
             return
@@ -654,11 +727,11 @@ def _render_plot_compare_tab() -> None:
 
         if not peak_df.empty:
             st.subheader("Peak Summary")
-            st.dataframe(peak_df, use_container_width=True)
+            _show_dataframe(peak_df, use_container_width=True)
 
         if not mean_std_df.empty:
             st.subheader("Mean ± STD")
-            st.dataframe(mean_std_df, use_container_width=True)
+            _show_dataframe(mean_std_df, use_container_width=True)
             mean_csv = mean_std_df.to_csv(index=False).encode("utf-8")
             st.download_button(
                 "Download mean±std CSV",
@@ -687,6 +760,9 @@ def _render_plot_compare_tab() -> None:
         accept_multiple_files=True,
         key="compare_uploader",
     )
+    if compare_files:
+        st.write(f"Loaded files: {len(compare_files)}")
+    compare_legend_map = _render_loaded_files_legend_table(compare_files, "compare")
 
     if st.button("Plot Mean DF(s)", key="compare_plot_button"):
         if not compare_files:
@@ -694,7 +770,7 @@ def _render_plot_compare_tab() -> None:
             return
 
         try:
-            fig, skipped = _build_mean_comparison_plot(compare_files)
+            fig, skipped = _build_mean_comparison_plot(compare_files, legend_map=compare_legend_map)
         except Exception as exc:
             st.error(f"Comparison plot failed: {exc}")
             return
@@ -750,7 +826,7 @@ def _render_fit_tab() -> None:
 
     if uploaded_files:
         st.write(f"Loaded files: {len(uploaded_files)}")
-        st.dataframe(pd.DataFrame({"filename": [f.name for f in uploaded_files]}), use_container_width=True, height=180)
+    fit_legend_map = _render_loaded_files_legend_table(uploaded_files, "fit")
 
     if not st.button("Fit Uploaded Files", type="primary", key="fit_button"):
         return
@@ -768,6 +844,7 @@ def _render_fit_tab() -> None:
     with st.spinner("Running fits..."):
         fit_results, plot_rows, skipped = _fit_uploaded_files(
             uploaded_files,
+            legend_map=fit_legend_map,
             model_name=model_name,
             gf=float(gf),
             fmin=fmin_val,
@@ -790,7 +867,7 @@ def _render_fit_tab() -> None:
 
     df = _results_dataframe(fit_results)
     st.subheader("Fit Summary")
-    st.dataframe(df, use_container_width=True)
+    _show_dataframe(df, use_container_width=True)
 
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     st.download_button(
